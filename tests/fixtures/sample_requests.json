@@ -1,0 +1,64 @@
+[
+  {
+    "prompt": "Is this email spam? Email: 'You won $1000000!'",
+    "task_type": "classify",
+    "max_latency_ms": 1000,
+    "min_quality_score": 0.8
+  },
+  {
+    "prompt": "Extract the name and email from: 'Contact John Smith at john@example.com'",
+    "task_type": "extract_json",
+    "max_latency_ms": 2000,
+    "min_quality_score": 0.9
+  },
+  {
+    "prompt": "Summarize this article: Machine learning is transforming how businesses operate. Companies are using ML for everything from customer service chatbots to fraud detection systems. The technology works by training algorithms on large datasets, allowing them to identify patterns and make predictions. While implementation can be challenging, the potential benefits in efficiency and accuracy are significant.",
+    "task_type": "summarize",
+    "max_latency_ms": 5000,
+    "min_quality_score": 0.85
+  },
+  {
+    "prompt": "Rewrite this more professionally: 'Hey, just wanted to check if you got my email?'",
+    "task_type": "rewrite",
+    "max_latency_ms": 2000,
+    "min_quality_score": 0.8
+  },
+  {
+    "prompt": "Write a detailed product description for a smart home security camera with night vision, motion detection, and two-way audio.",
+    "task_type": "generate_long",
+    "max_latency_ms": 15000,
+    "min_quality_score": 0.85
+  },
+  {
+    "prompt": "What's the best way to learn Python programming?",
+    "task_type": "chat",
+    "max_latency_ms": 3000,
+    "min_quality_score": 0.8
+  },
+  {
+    "prompt": "Classify sentiment: 'This product is absolutely terrible, worst purchase ever!'",
+    "task_type": "classify",
+    "max_latency_ms": 500,
+    "min_quality_score": 0.9
+  },
+  {
+    "prompt": "Parse this address into JSON: '123 Main Street, Apt 4B, New York, NY 10001, USA'",
+    "task_type": "extract_json",
+    "max_latency_ms": 2000,
+    "min_quality_score": 0.95,
+    "require_tools": true
+  },
+  {
+    "prompt": "This is a critical legal document that needs to be summarized accurately. The contract states that Party A agrees to provide services to Party B for a period of 12 months beginning January 1, 2024. The total compensation shall be $120,000 payable in monthly installments. Either party may terminate with 30 days written notice.",
+    "task_type": "summarize",
+    "max_latency_ms": 10000,
+    "min_quality_score": 0.98,
+    "require_verifier": true
+  },
+  {
+    "prompt": "Quick question - what's 2+2?",
+    "task_type": "chat",
+    "max_latency_ms": 300,
+    "min_quality_score": 0.7
+  }
+]

@@ -1,25 +1,24 @@
 """
-Smart Classifier for Conductor.
+Smart Classifier - LLM-based complexity detection.
 
-Uses a lightweight LLM call to semantically understand prompt complexity,
-rather than relying on regex patterns.
+Uses a quick, cheap LLM call to understand prompt complexity
+instead of relying on regex rules.
+
+Cost: ~$0.00002 per classification
 """
 
-import re
-from typing import Optional
+import hashlib
 from dataclasses import dataclass
+from typing import Optional, Dict
+from collections import OrderedDict
+
+try:
+    from openai import OpenAI
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
 
 
-@dataclass
-class SmartClassification:
-    """Result of smart classification."""
-    complexity_score: float  # 0.0 to 1.0
-    reasoning: str  # Brief explanation
-    raw_score: int  # Original 1-10 score
-    from_cache: bool = False
-
-
-# Classification prompt - kept minimal for speed/cost
 CLASSIFICATION_PROMPT = """Rate this prompt's complexity for an AI assistant (1-10):
 
 1-2: Trivial (basic facts, simple math, yes/no)
@@ -28,273 +27,202 @@ CLASSIFICATION_PROMPT = """Rate this prompt's complexity for an AI assistant (1-
 7-8: Complex (multi-step reasoning, expertise needed)
 9-10: Very complex (deep analysis, specialized domain, ambiguity)
 
-Consider:
-- Reasoning depth required
-- Domain expertise needed
-- Ambiguity/interpretation needed
-- Number of steps/subtasks
-
 Prompt: "{prompt}"
 
 Reply with ONLY a number 1-10, nothing else."""
 
 
-class SmartClassifier:
-    """
-    Uses LLM to classify prompt complexity semantically.
+@dataclass
+class SmartClassification:
+    """Result of smart classification."""
+    complexity_score: float  # 0.0 to 1.0
+    raw_score: int  # 1 to 10
+    reasoning: str
+    from_cache: bool = False
 
-    Much more accurate than regex-based classification because it
-    actually understands what the prompt is asking for.
+
+class SmartClassifier:
+    """LLM-based prompt complexity classifier.
+
+    Uses a quick LLM call to semantically understand prompt complexity.
+    Much better than regex rules at understanding context.
+
+    Example:
+        classifier = SmartClassifier()
+        result = classifier.classify("What is 2+2?")
+        print(result.complexity_score)  # 0.1 (very simple)
+
+        result = classifier.classify("Analyze the economic implications...")
+        print(result.complexity_score)  # 0.8 (complex)
     """
 
     def __init__(
         self,
-        provider=None,
+        api_key: Optional[str] = None,
+        model: str = "gpt-4o-mini",
         cache_enabled: bool = True,
         max_cache_size: int = 1000,
         timeout_ms: int = 2000,
     ):
-        """
-        Initialize smart classifier.
+        """Initialize the classifier.
 
         Args:
-            provider: LLM provider for classification calls.
-                     If None, will use OpenAI with OPENAI_API_KEY.
-            cache_enabled: Cache classifications for identical prompts.
-            max_cache_size: Maximum cache entries.
-            timeout_ms: Timeout for classification call.
+            api_key: OpenAI API key (or uses OPENAI_API_KEY env var)
+            model: Model to use for classification (default: gpt-4o-mini)
+            cache_enabled: Whether to cache results
+            max_cache_size: Maximum cache entries
+            timeout_ms: Timeout for classification calls
         """
-        self.provider = provider
+        self.api_key = api_key
+        self.model = model
         self.cache_enabled = cache_enabled
         self.max_cache_size = max_cache_size
         self.timeout_ms = timeout_ms
-        self._cache: dict[str, SmartClassification] = {}
+
+        self._cache: OrderedDict[str, SmartClassification] = OrderedDict()
+        self._client: Optional[OpenAI] = None
+
+    def _get_client(self) -> OpenAI:
+        """Get or create OpenAI client."""
+        if self._client is None:
+            if not HAS_OPENAI:
+                raise ImportError("OpenAI not installed. Run: pip install openai")
+            self._client = OpenAI(api_key=self.api_key)
+        return self._client
+
+    def _cache_key(self, prompt: str) -> str:
+        """Generate cache key for a prompt."""
+        return hashlib.md5(prompt.encode()).hexdigest()[:16]
+
+    def _parse_score(self, response: str) -> int:
+        """Parse score from LLM response."""
+        try:
+            # Extract just the number
+            cleaned = ''.join(c for c in response if c.isdigit())
+            if cleaned:
+                score = int(cleaned[:2])  # Take first 2 digits max
+                return max(1, min(10, score))  # Clamp to 1-10
+        except (ValueError, IndexError):
+            pass
+        return 5  # Default to medium if parsing fails
+
+    def _get_reasoning(self, score: int) -> str:
+        """Get human-readable reasoning for a score."""
+        if score <= 2:
+            return "Trivial task - basic facts or simple operations"
+        elif score <= 4:
+            return "Simple task - straightforward with clear answer"
+        elif score <= 6:
+            return "Moderate task - requires some reasoning"
+        elif score <= 8:
+            return "Complex task - multi-step reasoning needed"
+        else:
+            return "Very complex - deep analysis or specialized knowledge"
 
     def classify(self, prompt: str) -> SmartClassification:
-        """
-        Classify prompt complexity using LLM.
+        """Classify a prompt's complexity.
 
         Args:
-            prompt: The user's prompt to classify.
+            prompt: The prompt to classify
 
         Returns:
-            SmartClassification with complexity score.
+            SmartClassification with complexity score (0-1), raw score (1-10),
+            and reasoning.
         """
-        # Check cache first
-        cache_key = self._get_cache_key(prompt)
-        if self.cache_enabled and cache_key in self._cache:
-            result = self._cache[cache_key]
-            return SmartClassification(
-                complexity_score=result.complexity_score,
-                reasoning=result.reasoning,
-                raw_score=result.raw_score,
-                from_cache=True,
+        # Check cache
+        if self.cache_enabled:
+            cache_key = self._cache_key(prompt)
+            if cache_key in self._cache:
+                cached = self._cache[cache_key]
+                # Move to end (LRU)
+                self._cache.move_to_end(cache_key)
+                return SmartClassification(
+                    complexity_score=cached.complexity_score,
+                    raw_score=cached.raw_score,
+                    reasoning=cached.reasoning,
+                    from_cache=True,
+                )
+
+        # Try LLM classification
+        try:
+            client = self._get_client()
+
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[{
+                    "role": "user",
+                    "content": CLASSIFICATION_PROMPT.format(
+                        prompt=prompt[:500]  # Limit prompt length
+                    )
+                }],
+                max_tokens=10,
+                temperature=0,
             )
 
-        # Make LLM call
-        raw_score = self._call_llm(prompt)
+            raw_score = self._parse_score(response.choices[0].message.content)
 
-        # Convert 1-10 to 0.0-1.0
+        except Exception:
+            # Fallback to heuristic
+            raw_score = self._fallback_score(prompt)
+
+        # Convert to 0-1 scale
         complexity_score = (raw_score - 1) / 9.0
-
-        # Generate reasoning based on score
         reasoning = self._get_reasoning(raw_score)
 
         result = SmartClassification(
             complexity_score=complexity_score,
-            reasoning=reasoning,
             raw_score=raw_score,
+            reasoning=reasoning,
             from_cache=False,
         )
 
         # Cache result
         if self.cache_enabled:
-            self._add_to_cache(cache_key, result)
+            self._cache[cache_key] = result
+            # Evict oldest if over limit
+            while len(self._cache) > self.max_cache_size:
+                self._cache.popitem(last=False)
 
         return result
 
-    def classify_sync(self, prompt: str) -> SmartClassification:
-        """Synchronous version of classify."""
-        return self.classify(prompt)
-
-    def _call_llm(self, prompt: str) -> int:
-        """
-        Make the actual LLM call for classification.
-
-        Returns score 1-10.
-        """
-        classification_prompt = CLASSIFICATION_PROMPT.format(
-            prompt=prompt[:2000]  # Truncate very long prompts
-        )
-
-        if self.provider is None:
-            # Try to use OpenAI
-            return self._call_openai(classification_prompt)
-        else:
-            # Use provided provider
-            return self._call_provider(classification_prompt)
-
-    def _call_openai(self, classification_prompt: str) -> int:
-        """Call OpenAI API for classification."""
-        try:
-            import openai
-            import os
-
-            client = openai.OpenAI(
-                api_key=os.environ.get("OPENAI_API_KEY"),
-                timeout=self.timeout_ms / 1000,
-            )
-
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",  # Cheapest, fastest
-                messages=[
-                    {"role": "user", "content": classification_prompt}
-                ],
-                max_tokens=5,  # Just need a number
-                temperature=0,  # Deterministic
-            )
-
-            return self._parse_score(response.choices[0].message.content)
-
-        except ImportError:
-            # OpenAI not installed, fall back to heuristic
-            return self._fallback_score(classification_prompt)
-        except Exception:
-            # API error, fall back to heuristic
-            return self._fallback_score(classification_prompt)
-
-    def _call_provider(self, classification_prompt: str) -> int:
-        """Call custom provider for classification."""
-        try:
-            # Provider should have a simple complete method
-            response = self.provider.complete(
-                prompt=classification_prompt,
-                max_tokens=5,
-                temperature=0,
-            )
-            return self._parse_score(response)
-        except Exception:
-            return self._fallback_score(classification_prompt)
-
-    def _parse_score(self, response: str) -> int:
-        """Parse LLM response to extract score."""
-        if response is None:
-            return 5  # Default to medium
-
-        # Extract first number from response
-        response = response.strip()
-        match = re.search(r'\d+', response)
-
-        if match:
-            score = int(match.group())
-            return max(1, min(10, score))  # Clamp to 1-10
-
-        return 5  # Default to medium if can't parse
-
     def _fallback_score(self, prompt: str) -> int:
-        """
-        Fallback heuristic when LLM call fails.
-
-        Uses simple rules as backup.
-        """
-        score = 5  # Start at medium
-
+        """Fallback heuristic when LLM call fails."""
         prompt_lower = prompt.lower()
 
-        # Simple indicators (reduce score)
-        simple_patterns = [
-            r'\bwhat is\b', r'\bwho is\b', r'\bwhen\b',
-            r'\byes or no\b', r'\btrue or false\b',
-            r'\bdefine\b', r'\blist\b',
-        ]
+        # Very simple patterns
+        simple_patterns = ["what is", "who is", "yes or no", "true or false"]
         for pattern in simple_patterns:
-            if re.search(pattern, prompt_lower):
-                score -= 1
-                break
+            if prompt_lower.startswith(pattern):
+                return 2
 
-        # Complex indicators (increase score)
-        complex_patterns = [
-            r'\bexplain why\b', r'\banalyze\b', r'\bcompare and contrast\b',
-            r'\bstep by step\b', r'\bprove\b', r'\bderive\b',
-            r'\bdesign\b', r'\barchitect\b', r'\bimplement\b',
-            r'\bdebug\b', r'\boptimize\b', r'\brefactor\b',
-        ]
-        for pattern in complex_patterns:
-            if re.search(pattern, prompt_lower):
-                score += 1
+        # Complex keywords
+        complex_keywords = ["analyze", "explain why", "compare", "debug", "implement"]
+        for keyword in complex_keywords:
+            if keyword in prompt_lower:
+                return 7
 
-        # Length factor
-        if len(prompt) > 2000:
-            score += 1
-        elif len(prompt) < 50:
-            score -= 1
-
-        # Code indicators
-        if re.search(r'```|def |class |function |import ', prompt):
-            score += 1
-
-        return max(1, min(10, score))
-
-    def _get_reasoning(self, score: int) -> str:
-        """Get human-readable reasoning for score."""
-        if score <= 2:
-            return "Trivial task - basic facts or simple operations"
-        elif score <= 4:
-            return "Simple task - straightforward, common knowledge"
-        elif score <= 6:
-            return "Moderate task - requires some reasoning"
-        elif score <= 8:
-            return "Complex task - multi-step reasoning or expertise needed"
+        # Length-based
+        if len(prompt) < 50:
+            return 3
+        elif len(prompt) < 200:
+            return 5
         else:
-            return "Very complex - deep analysis, specialized domain"
-
-    def _get_cache_key(self, prompt: str) -> str:
-        """Generate cache key from prompt."""
-        # Use first 500 chars + length as key
-        # This handles most cases while keeping key size reasonable
-        return f"{prompt[:500]}_{len(prompt)}"
-
-    def _add_to_cache(self, key: str, result: SmartClassification):
-        """Add result to cache, evicting old entries if needed."""
-        if len(self._cache) >= self.max_cache_size:
-            # Simple eviction: remove first entry
-            first_key = next(iter(self._cache))
-            del self._cache[first_key]
-
-        self._cache[key] = result
+            return 6
 
     def clear_cache(self):
         """Clear the classification cache."""
         self._cache.clear()
 
-    def get_cache_stats(self) -> dict:
-        """Get cache statistics."""
-        return {
-            "size": len(self._cache),
-            "max_size": self.max_cache_size,
-            "enabled": self.cache_enabled,
-        }
 
+def smart_classify(prompt: str, api_key: Optional[str] = None) -> SmartClassification:
+    """Convenience function to classify a single prompt.
 
-# Singleton instance for convenience
-_default_classifier: Optional[SmartClassifier] = None
+    Args:
+        prompt: The prompt to classify
+        api_key: Optional OpenAI API key
 
-
-def get_smart_classifier() -> SmartClassifier:
-    """Get or create the default smart classifier."""
-    global _default_classifier
-    if _default_classifier is None:
-        _default_classifier = SmartClassifier()
-    return _default_classifier
-
-
-def smart_classify(prompt: str) -> SmartClassification:
+    Returns:
+        SmartClassification result
     """
-    Convenience function to classify a prompt.
-
-    Example:
-        result = smart_classify("What is 2+2?")
-        print(result.complexity_score)  # 0.1 (low)
-        print(result.reasoning)  # "Trivial task - basic facts"
-    """
-    return get_smart_classifier().classify(prompt)
+    classifier = SmartClassifier(api_key=api_key)
+    return classifier.classify(prompt)
